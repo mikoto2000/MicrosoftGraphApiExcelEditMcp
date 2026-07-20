@@ -1,10 +1,12 @@
 {
   "settings": {
     "clientId": "",
+    "clientSecret": "",
     "tenantId": "",
     "graphUserScopes": [
       "Files.ReadWrite"
-    ]
+    ],
+    "tokenCachePath": ""
   }
 }
 

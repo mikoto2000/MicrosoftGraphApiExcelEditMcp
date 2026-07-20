@@ -32,17 +32,21 @@ Azure portal 側でも同じ delegated permission を追加し、必要に応じ
 
 ## 設定
 
-`appsettings.json` を作成し、Azure AD アプリ登録の値を設定します。
+`appsettings.json` を作成し、Azure AD アプリ登録の値を設定します。Azure portal のアプリ登録では、リダイレクト URI に MCP サーバーの callback URL を登録してください。ローカルで `http://localhost:3001` 起動する場合は `http://localhost:3001/auth/callback` です。
+
+Web プラットフォームに redirect URI を登録した場合は client secret が必要です。Mobile and desktop applications の public client として登録した場合は client secret を空にできます。
 
 ```json
 {
   "Settings": {
     "ClientId": "アプリケーション クライアント ID",
+    "ClientSecret": "Web プラットフォームを使う場合のクライアントシークレット。public client の場合は空",
     "TenantId": "テナント ID",
     "GraphUserScopes": [
       "Sites.ReadWrite.All",
       "Files.ReadWrite.All"
-    ]
+    ],
+    "TokenCachePath": ""
   }
 }
 ```
@@ -66,7 +70,19 @@ https://[テナント名].sharepoint.com/sites/[サイト名]/_api/web/id
 dotnet run
 ```
 
-初回実行時はデバイスコード認証の案内が表示されます。表示された URL にアクセスし、コードを入力してサインインします。
+初回実行後、ブラウザーで `/auth/login` を開いて Microsoft にサインインします。サインインが完了すると `/auth/callback` でトークンを受け取り、以後の MCP tool 呼び出しは保存されたトークンキャッシュを使います。
+
+```text
+http://localhost:3001/auth/login
+```
+
+認証状態は以下で確認できます。
+
+```text
+http://localhost:3001/auth/status
+```
+
+`TokenCachePath` を空にした場合、トークンキャッシュは OS のローカルアプリケーションデータ配下に保存されます。共有環境では、必要に応じてアクセス権を制限したパスを明示してください。
 
 ## 使用例
 
@@ -136,7 +152,7 @@ MCP endpoint は以下です。
 http://localhost:3001/mcp
 ```
 
-ブラウザーなどで `/` にアクセスすると、サーバー名と MCP endpoint を返します。初回の Microsoft Graph 呼び出し時にデバイスコード認証が必要な場合は、サーバーログに認証 URL とコードが表示されます。
+ブラウザーなどで `/` にアクセスすると、サーバー名、MCP endpoint、認証用 endpoint を返します。未認証の場合は `/auth/login` を開いて Microsoft にサインインしてから MCP tool を呼び出してください。
 
 公開している MCP tool は以下です。
 

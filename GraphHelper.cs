@@ -1,4 +1,10 @@
-using Azure.Identity;
+using Azure.Core;
+
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 using Microsoft.Graph;
 using Microsoft.Kiota.Abstractions;
@@ -15,9 +21,13 @@ public sealed class GraphHelper
 
   private Settings? settings;
 
-  private DeviceCodeCredential? deviceCodeCredential;
+  private OAuthAuthorizationCodeCredential? graphTokenCredential;
 
   private GraphServiceClient? userClient;
+
+  private string? expectedAuthorizationState;
+
+  private string? authorizationCodeVerifier;
   private readonly Dictionary<string, string> currentEditExcelSessionIds = new();
 
   /**
@@ -27,40 +37,123 @@ public sealed class GraphHelper
 
   /**
    * ユーザー認証用の Graph クライアントを初期化する。
-   *
-   * @param settings Microsoft Graph 接続設定
-   * @param deviceCodePrompt デバイスコード認証時に表示するコールバック
    */
-  public static GraphHelper InitializeGraphForUserAuth(
-      Settings settings,
-      Func<DeviceCodeInfo, CancellationToken, Task> deviceCodePrompt)
+  public static GraphHelper InitializeGraphForUserAuth(Settings settings)
   {
-
     if (_graphHelper != null)
     {
       return _graphHelper;
     }
 
-    _graphHelper = new GraphHelper();
-
-    // Ensure settings isn't null
     _ = settings ??
       throw new NullReferenceException("Settings cannot be null");
+    _ = settings.ClientId ??
+      throw new NullReferenceException("Settings.ClientId cannot be null");
+    _ = settings.TenantId ??
+      throw new NullReferenceException("Settings.TenantId cannot be null");
+    _ = settings.GraphUserScopes ??
+      throw new NullReferenceException("Settings.GraphUserScopes cannot be null");
 
+    _graphHelper = new GraphHelper();
     _graphHelper.settings = settings;
-
-     var options = new DeviceCodeCredentialOptions
-        {
-            ClientId = settings.ClientId,
-            TenantId = settings.TenantId,
-            DeviceCodeCallback = deviceCodePrompt,
-        };
-
-        _graphHelper.deviceCodeCredential = new DeviceCodeCredential(options);
-
-        _graphHelper.userClient = new GraphServiceClient(_graphHelper.deviceCodeCredential, settings.GraphUserScopes);
+    _graphHelper.graphTokenCredential = new OAuthAuthorizationCodeCredential(settings, _graphHelper.GetTokenCachePath());
+    _graphHelper.userClient = new GraphServiceClient(_graphHelper.graphTokenCredential, settings.GraphUserScopes);
 
     return _graphHelper;
+  }
+
+  public Uri GetAuthorizationUrl(string redirectUri)
+  {
+    _ = settings?.ClientId ??
+      throw new NullReferenceException("Settings.ClientId cannot be null");
+    _ = settings.TenantId ??
+      throw new NullReferenceException("Settings.TenantId cannot be null");
+    _ = settings.GraphUserScopes ??
+      throw new NullReferenceException("Settings.GraphUserScopes cannot be null");
+
+    expectedAuthorizationState = Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
+    authorizationCodeVerifier = Base64UrlEncode(RandomNumberGenerator.GetBytes(64));
+    var codeChallenge = Base64UrlEncode(SHA256.HashData(Encoding.ASCII.GetBytes(authorizationCodeVerifier)));
+    var authorizationScopes = WithOfflineAccess(settings.GraphUserScopes);
+    var query = ToQueryString(new Dictionary<string, string>
+    {
+      ["client_id"] = settings.ClientId,
+      ["response_type"] = "code",
+      ["redirect_uri"] = redirectUri,
+      ["response_mode"] = "query",
+      ["scope"] = string.Join(" ", authorizationScopes),
+      ["state"] = expectedAuthorizationState,
+      ["code_challenge"] = codeChallenge,
+      ["code_challenge_method"] = "S256",
+      ["prompt"] = "select_account",
+    });
+
+    return new Uri($"https://login.microsoftonline.com/{Uri.EscapeDataString(settings.TenantId)}/oauth2/v2.0/authorize?{query}");
+  }
+
+  public async Task CompleteAuthorizationCodeFlowAsync(string code, string state, string redirectUri)
+  {
+    _ = graphTokenCredential ??
+      throw new NullReferenceException("Graph has not been initialized for user auth");
+
+    if (string.IsNullOrWhiteSpace(expectedAuthorizationState) || !string.Equals(expectedAuthorizationState, state, StringComparison.Ordinal))
+    {
+      throw new InvalidOperationException("The authorization state is invalid or expired. Start authentication again from /auth/login.");
+    }
+
+    if (string.IsNullOrWhiteSpace(authorizationCodeVerifier))
+    {
+      throw new InvalidOperationException("The authorization code verifier is missing. Start authentication again from /auth/login.");
+    }
+
+    await graphTokenCredential.ExchangeAuthorizationCodeAsync(code, redirectUri, authorizationCodeVerifier);
+    expectedAuthorizationState = null;
+    authorizationCodeVerifier = null;
+  }
+
+  public async Task<bool> IsAuthenticatedAsync()
+  {
+    _ = graphTokenCredential ??
+      throw new NullReferenceException("Graph has not been initialized for user auth");
+
+    return await graphTokenCredential.HasCachedRefreshTokenAsync();
+  }
+
+  private string GetTokenCachePath()
+  {
+    if (!string.IsNullOrWhiteSpace(settings?.TokenCachePath))
+    {
+      return settings.TokenCachePath;
+    }
+
+    var basePath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    if (string.IsNullOrWhiteSpace(basePath))
+    {
+      basePath = AppContext.BaseDirectory;
+    }
+
+    return Path.Combine(basePath, "edit-excel-mcp", "oauth-token-cache.json");
+  }
+
+  private static string Base64UrlEncode(byte[] bytes)
+  {
+    return Convert.ToBase64String(bytes)
+      .TrimEnd('=')
+      .Replace('+', '-')
+      .Replace('/', '_');
+  }
+
+  private static string ToQueryString(IReadOnlyDictionary<string, string> values)
+  {
+    return string.Join("&", values.Select(item => $"{Uri.EscapeDataString(item.Key)}={Uri.EscapeDataString(item.Value)}"));
+  }
+
+  public static string[] WithOfflineAccess(IEnumerable<string> scopes)
+  {
+    return scopes
+      .Append("offline_access")
+      .Distinct(StringComparer.OrdinalIgnoreCase)
+      .ToArray();
   }
 
   /**
@@ -1037,3 +1130,116 @@ public sealed class GraphHelper
     return columnName;
   }
 }
+
+
+public sealed class OAuthAuthorizationCodeCredential(Settings settings, string tokenCachePath) : TokenCredential
+{
+  private static readonly HttpClient HttpClient = new();
+
+  public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
+  {
+    return GetTokenAsync(requestContext, cancellationToken).AsTask().GetAwaiter().GetResult();
+  }
+
+  public override async ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken)
+  {
+    var cache = await ReadTokenCacheAsync(cancellationToken);
+    if (cache?.RefreshToken == null)
+    {
+      throw new InvalidOperationException("Microsoft Graph is not authenticated. Open /auth/login in this MCP server, sign in, then retry the tool call.");
+    }
+
+    if (cache.AccessToken != null && cache.ExpiresOn > DateTimeOffset.UtcNow.AddMinutes(5))
+    {
+      return new AccessToken(cache.AccessToken, cache.ExpiresOn);
+    }
+
+    var scopes = requestContext.Scopes.Length > 0 ? requestContext.Scopes : settings.GraphUserScopes!;
+    var refreshed = await RequestTokenAsync(new Dictionary<string, string>
+    {
+      ["client_id"] = settings.ClientId!,
+      ["grant_type"] = "refresh_token",
+      ["refresh_token"] = cache.RefreshToken,
+      ["scope"] = string.Join(" ", scopes),
+    }, cancellationToken);
+    if (string.IsNullOrWhiteSpace(refreshed.RefreshToken))
+    {
+      refreshed = refreshed with { RefreshToken = cache.RefreshToken };
+    }
+
+    await WriteTokenCacheAsync(refreshed, cancellationToken);
+    return new AccessToken(refreshed.AccessToken!, refreshed.ExpiresOn);
+  }
+
+  public async Task ExchangeAuthorizationCodeAsync(string code, string redirectUri, string codeVerifier)
+  {
+    var token = await RequestTokenAsync(new Dictionary<string, string>
+    {
+      ["client_id"] = settings.ClientId!,
+      ["grant_type"] = "authorization_code",
+      ["code"] = code,
+      ["redirect_uri"] = redirectUri,
+      ["code_verifier"] = codeVerifier,
+      ["scope"] = string.Join(" ", GraphHelper.WithOfflineAccess(settings.GraphUserScopes!)),
+    }, CancellationToken.None);
+    await WriteTokenCacheAsync(token, CancellationToken.None);
+  }
+
+  public async Task<bool> HasCachedRefreshTokenAsync()
+  {
+    var cache = await ReadTokenCacheAsync(CancellationToken.None);
+    return !string.IsNullOrWhiteSpace(cache?.RefreshToken);
+  }
+
+  private async Task<CachedOAuthToken> RequestTokenAsync(Dictionary<string, string> formValues, CancellationToken cancellationToken)
+  {
+    if (!string.IsNullOrWhiteSpace(settings.ClientSecret))
+    {
+      formValues["client_secret"] = settings.ClientSecret;
+    }
+
+    var tokenEndpoint = $"https://login.microsoftonline.com/{Uri.EscapeDataString(settings.TenantId!)}/oauth2/v2.0/token";
+    using var response = await HttpClient.PostAsync(tokenEndpoint, new FormUrlEncodedContent(formValues), cancellationToken);
+    if (!response.IsSuccessStatusCode)
+    {
+      var error = await response.Content.ReadAsStringAsync(cancellationToken);
+      throw new InvalidOperationException($"Microsoft Graph token request failed: {(int)response.StatusCode} {response.ReasonPhrase}. {error}");
+    }
+
+    var token = await response.Content.ReadFromJsonAsync<OAuthTokenResponse>(cancellationToken);
+    if (token?.AccessToken == null)
+    {
+      throw new InvalidOperationException("Microsoft Graph token response did not contain an access token.");
+    }
+
+    return new CachedOAuthToken(
+      token.AccessToken,
+      token.RefreshToken,
+      DateTimeOffset.UtcNow.AddSeconds(token.ExpiresIn));
+  }
+
+  private async Task<CachedOAuthToken?> ReadTokenCacheAsync(CancellationToken cancellationToken)
+  {
+    if (!File.Exists(tokenCachePath))
+    {
+      return null;
+    }
+
+    await using var stream = File.OpenRead(tokenCachePath);
+    return await JsonSerializer.DeserializeAsync<CachedOAuthToken>(stream, cancellationToken: cancellationToken);
+  }
+
+  private async Task WriteTokenCacheAsync(CachedOAuthToken token, CancellationToken cancellationToken)
+  {
+    Directory.CreateDirectory(Path.GetDirectoryName(tokenCachePath)!);
+    await using var stream = File.Create(tokenCachePath);
+    await JsonSerializer.SerializeAsync(stream, token, cancellationToken: cancellationToken);
+  }
+}
+
+public sealed record CachedOAuthToken(string? AccessToken, string? RefreshToken, DateTimeOffset ExpiresOn);
+
+public sealed record OAuthTokenResponse(
+  [property: JsonPropertyName("access_token")] string? AccessToken,
+  [property: JsonPropertyName("refresh_token")] string? RefreshToken,
+  [property: JsonPropertyName("expires_in")] int ExpiresIn);
