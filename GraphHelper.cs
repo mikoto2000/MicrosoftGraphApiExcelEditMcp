@@ -18,9 +18,7 @@ public sealed class GraphHelper
   private DeviceCodeCredential? deviceCodeCredential;
 
   private GraphServiceClient? userClient;
-
-  // TODO: Map にして複数同時対応できるか確認
-  private string? currentEditExcelSessionId;
+  private readonly Dictionary<string, string> currentEditExcelSessionIds = new();
 
   /**
    * シングルトンとして利用するため、外部からのインスタンス生成を禁止する。
@@ -209,7 +207,7 @@ public sealed class GraphHelper
       throw new Exception($"Failed to create excel session {drive.Name}/{driveItem.Name}");
     }
 
-    currentEditExcelSessionId = result.Id;
+    currentEditExcelSessionIds[driveItem.Id] = result.Id!;
   }
 
   /**
@@ -226,8 +224,9 @@ public sealed class GraphHelper
     _ = driveItem.Id ??
       throw new NullReferenceException("Drive item id cannot be null");
 
-    if (currentEditExcelSessionId != null) {
-      await userClient.Drives[drive.Id].Items[driveItem.Id].Workbook.CloseSession.PostAsync(requestConfiguration => requestConfiguration.Headers.Add("Workbook-Session-Id", currentEditExcelSessionId));
+    if (currentEditExcelSessionIds.TryGetValue(driveItem.Id, out var sessionId)) {
+      await userClient.Drives[drive.Id].Items[driveItem.Id].Workbook.CloseSession.PostAsync(requestConfiguration => requestConfiguration.Headers.Add("Workbook-Session-Id", sessionId));
+      currentEditExcelSessionIds.Remove(driveItem.Id);
     }
   }
 
@@ -247,10 +246,7 @@ public sealed class GraphHelper
 
     var worksheets = await userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets.GetAsync(requestConfiguration =>
     {
-      if (currentEditExcelSessionId != null)
-      {
-        requestConfiguration.Headers.Add("Workbook-Session-Id", currentEditExcelSessionId);
-      }
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (worksheets == null || worksheets.Value == null)
     {
@@ -286,7 +282,7 @@ public sealed class GraphHelper
 
     var worksheet = await userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets.Add.PostAsync(requestBody, requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (worksheet == null)
     {
@@ -326,7 +322,7 @@ public sealed class GraphHelper
 
     var updatedWorksheet = await userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets[worksheet.Id].PatchAsync(requestBody, requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (updatedWorksheet == null)
     {
@@ -371,7 +367,7 @@ public sealed class GraphHelper
 
     var requestInfo = worksheetRequestBuilder.RangeWithAddress(cellAddress).ToGetRequestInformation(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     requestInfo.HttpMethod = Method.PATCH;
     requestInfo.SetContentFromParsable(userClient.RequestAdapter, "application/json", values);
@@ -424,7 +420,7 @@ public sealed class GraphHelper
 
     var requestInfo = worksheetRequestBuilder.RangeWithAddress(rangeAddress).ToGetRequestInformation(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     requestInfo.HttpMethod = Method.PATCH;
     requestInfo.SetContentFromParsable(userClient.RequestAdapter, "application/json", rangeValues);
@@ -472,7 +468,7 @@ public sealed class GraphHelper
 
     var range = await userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets[worksheet.Id].RangeWithAddress(cellAddress).GetAsync(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (range == null)
     {
@@ -506,7 +502,7 @@ public sealed class GraphHelper
 
     var usedRange = await userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets[worksheet.Id].UsedRange.GetAsync(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (usedRange == null)
     {
@@ -541,7 +537,7 @@ public sealed class GraphHelper
 
     var range = await userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets[worksheet.Id].RangeWithAddress(rangeAddress).GetAsync(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (range == null)
     {
@@ -605,7 +601,7 @@ public sealed class GraphHelper
     var worksheetRequestBuilder = userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets[worksheet.Id];
     var usedRange = await worksheetRequestBuilder.UsedRange.GetAsync(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (usedRange == null)
     {
@@ -613,7 +609,7 @@ public sealed class GraphHelper
     }
 
     var nextRowIndex = (usedRange.RowIndex ?? 0) + (usedRange.RowCount ?? 0);
-    return await UpdateRange(worksheetRequestBuilder, nextRowIndex + 1, row);
+    return await UpdateRange(worksheetRequestBuilder, exelFile.Id, nextRowIndex + 1, row);
   }
   /**
    * Excel のシートに複数行を追加する。
@@ -638,7 +634,7 @@ public sealed class GraphHelper
     var worksheetRequestBuilder = userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets[worksheet.Id];
     var usedRange = await worksheetRequestBuilder.UsedRange.GetAsync(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
     if (usedRange == null)
     {
@@ -646,7 +642,7 @@ public sealed class GraphHelper
     }
 
     var nextRowIndex = (usedRange.RowIndex ?? 0) + (usedRange.RowCount ?? 0);
-    return await UpdateRange(worksheetRequestBuilder, nextRowIndex + 1, rows);
+    return await UpdateRange(worksheetRequestBuilder, exelFile.Id, nextRowIndex + 1, rows);
   }
 
   /**
@@ -680,10 +676,10 @@ public sealed class GraphHelper
 
     await worksheetRequestBuilder.RangeWithAddress(address).Insert.PostAsync(requestBody, requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
 
-    return await UpdateRange(worksheetRequestBuilder, rowNumber, row);
+    return await UpdateRange(worksheetRequestBuilder, exelFile.Id, rowNumber, row);
   }
 
   /**
@@ -717,10 +713,10 @@ public sealed class GraphHelper
 
     await worksheetRequestBuilder.RangeWithAddress(address).Insert.PostAsync(requestBody, requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, exelFile.Id);
     });
 
-    return await UpdateRange(worksheetRequestBuilder, rowNumber, rows);
+    return await UpdateRange(worksheetRequestBuilder, exelFile.Id, rowNumber, rows);
   }
 
   /**
@@ -746,20 +742,20 @@ public sealed class GraphHelper
     ValidateRow(row);
 
     var worksheetRequestBuilder = userClient.Drives[drive.Id].Items[exelFile.Id].Workbook.Worksheets[worksheet.Id];
-    return await UpdateRange(worksheetRequestBuilder, rowNumber, row);
+    return await UpdateRange(worksheetRequestBuilder, exelFile.Id, rowNumber, row);
   }
 
   /**
    * 指定行の単一行 Range に値を書き込む。
    */
-  private async Task<WorkbookRange> UpdateRange(Microsoft.Graph.Drives.Item.Items.Item.Workbook.Worksheets.Item.WorkbookWorksheetItemRequestBuilder worksheetRequestBuilder, int rowNumber, object[] row) {
-    return await UpdateRange(worksheetRequestBuilder, rowNumber, new object[][] { row });
+  private async Task<WorkbookRange> UpdateRange(Microsoft.Graph.Drives.Item.Items.Item.Workbook.Worksheets.Item.WorkbookWorksheetItemRequestBuilder worksheetRequestBuilder, string? driveItemId, int rowNumber, object[] row) {
+    return await UpdateRange(worksheetRequestBuilder, driveItemId, rowNumber, new object[][] { row });
   }
 
   /**
    * 指定行から始まる複数行 Range に値を書き込む。
    */
-  private async Task<WorkbookRange> UpdateRange(Microsoft.Graph.Drives.Item.Items.Item.Workbook.Worksheets.Item.WorkbookWorksheetItemRequestBuilder worksheetRequestBuilder, int rowNumber, object[][] rows) {
+  private async Task<WorkbookRange> UpdateRange(Microsoft.Graph.Drives.Item.Items.Item.Workbook.Worksheets.Item.WorkbookWorksheetItemRequestBuilder worksheetRequestBuilder, string? driveItemId, int rowNumber, object[][] rows) {
     ValidateRowNumber(rowNumber);
     ValidateRows(rows);
 
@@ -771,7 +767,7 @@ public sealed class GraphHelper
 
     var requestInfo = worksheetRequestBuilder.RangeWithAddress(address).ToGetRequestInformation(requestConfiguration =>
     {
-      AddWorkbookSessionHeader(requestConfiguration.Headers);
+      AddWorkbookSessionHeader(requestConfiguration.Headers, driveItemId);
     });
     requestInfo.HttpMethod = Method.PATCH;
     requestInfo.SetContentFromParsable(userClient!.RequestAdapter, "application/json", values);
@@ -994,10 +990,10 @@ public sealed class GraphHelper
   /**
    * Excel workbook session 用のヘッダーを追加する。
    */
-  private void AddWorkbookSessionHeader(Microsoft.Kiota.Abstractions.RequestHeaders headers) {
-    if (currentEditExcelSessionId != null)
+  private void AddWorkbookSessionHeader(Microsoft.Kiota.Abstractions.RequestHeaders headers, string? driveItemId) {
+    if (driveItemId != null && currentEditExcelSessionIds.TryGetValue(driveItemId, out var sessionId))
     {
-      headers.Add("Workbook-Session-Id", currentEditExcelSessionId);
+      headers.Add("Workbook-Session-Id", sessionId);
     }
   }
 

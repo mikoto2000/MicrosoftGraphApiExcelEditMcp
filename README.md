@@ -36,12 +36,14 @@ Azure portal 側でも同じ delegated permission を追加し、必要に応じ
 
 ```json
 {
-  "clientId": "アプリケーション クライアント ID",
-  "tenantId": "テナント ID",
-  "graphUserScopes": [
-    "Sites.ReadWrite.All",
-    "Files.ReadWrite.All"
-  ]
+  "Settings": {
+    "ClientId": "アプリケーション クライアント ID",
+    "TenantId": "テナント ID",
+    "GraphUserScopes": [
+      "Sites.ReadWrite.All",
+      "Files.ReadWrite.All"
+    ]
+  }
 }
 ```
 
@@ -119,3 +121,44 @@ await graphHelper.CloseExcelSession(drive, excelFile);
 ## 補足
 
 `WorkbookRange.Address` は `"Sheet1!A1:B2"` のようにシート名付きで返ることがあります。`GetRangeValues` の `WorkbookRange` オーバーロードでは、内部で `!` より後ろの `A1:B2` 部分を使って値を取得します。
+
+## HTTP MCP サーバー
+
+このアプリケーションは Streamable HTTP 対応の MCP サーバーとして起動します。
+
+```bash
+dotnet run --urls http://localhost:3001
+```
+
+MCP endpoint は以下です。
+
+```text
+http://localhost:3001/mcp
+```
+
+ブラウザーなどで `/` にアクセスすると、サーバー名と MCP endpoint を返します。初回の Microsoft Graph 呼び出し時にデバイスコード認証が必要な場合は、サーバーログに認証 URL とコードが表示されます。
+
+公開している MCP tool は以下です。
+
+- `get_site_default_drive`
+- `upload_file_base64`
+- `download_file_base64`
+- `create_empty_excel_file`
+- `get_drive_item_by_path`
+- `create_excel_session`
+- `close_excel_session`
+- `list_worksheets`
+- `create_worksheet`
+- `rename_worksheet`
+- `set_cell_value`
+- `get_cell_value`
+- `set_range_values`
+- `get_used_range`
+- `get_range_values`
+- `add_row`
+- `add_rows`
+- `insert_row`
+- `insert_rows`
+- `update_row`
+
+各 tool は Graph SDK の `Drive` や `WorkbookWorksheet` オブジェクトを直接受け取らず、`siteId`、`filePath`、`worksheetName`、`cellAddress`、`rangeAddress`、`values` などの JSON 化しやすい引数で呼び出します。
