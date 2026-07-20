@@ -76,13 +76,26 @@ dotnet run
 http://localhost:3001/auth/login
 ```
 
+複数ユーザーで同じ MCP サーバーを使う場合は、ユーザーごとに profile 名を分けて認証します。
+
+```text
+http://localhost:3001/auth/login?profile=alice
+http://localhost:3001/auth/login?profile=bob
+```
+
+MCP tool 呼び出しでは、HTTP ヘッダー `X-Excel-Mcp-Profile` に同じ profile 名を指定します。ヘッダーがない場合は `default` profile を使います。
+
+```text
+X-Excel-Mcp-Profile: alice
+```
+
 認証状態は以下で確認できます。
 
 ```text
-http://localhost:3001/auth/status
+http://localhost:3001/auth/status?profile=alice
 ```
 
-`TokenCachePath` を空にした場合、トークンキャッシュは OS のローカルアプリケーションデータ配下に保存されます。共有環境では、必要に応じてアクセス権を制限したパスを明示してください。
+`TokenCachePath` を空にした場合、トークンキャッシュは OS のローカルアプリケーションデータ配下に profile ごとに保存されます。`TokenCachePath` を明示した場合も、`default` 以外はファイル名に profile 名を付けて分離されます。共有環境では、必要に応じてアクセス権を制限したパスを指定してください。
 
 ## 使用例
 
@@ -152,7 +165,7 @@ MCP endpoint は以下です。
 http://localhost:3001/mcp
 ```
 
-ブラウザーなどで `/` にアクセスすると、サーバー名、MCP endpoint、認証用 endpoint を返します。未認証の場合は `/auth/login` を開いて Microsoft にサインインしてから MCP tool を呼び出してください。
+ブラウザーなどで `/` にアクセスすると、サーバー名、MCP endpoint、profile 指定方法、認証用 endpoint を返します。未認証の場合は `/auth/login?profile=...` を開いて Microsoft にサインインしてから、同じ profile を `X-Excel-Mcp-Profile` ヘッダーに指定して MCP tool を呼び出してください。
 
 公開している MCP tool は以下です。
 

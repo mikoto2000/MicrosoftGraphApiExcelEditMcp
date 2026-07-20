@@ -1,5 +1,6 @@
 using Azure.Core;
 
+using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
@@ -19,16 +20,21 @@ public sealed class GraphHelper
 {
   private static GraphHelper? _graphHelper;
 
+  public const string DefaultProfile = "default";
+
+  private static readonly AsyncLocal<string?> CurrentProfile = new();
+
   private Settings? settings;
 
-  private OAuthAuthorizationCodeCredential? graphTokenCredential;
+  private readonly ConcurrentDictionary<string, OAuthAuthorizationCodeCredential> graphTokenCredentials = new(StringComparer.OrdinalIgnoreCase);
 
-  private GraphServiceClient? userClient;
+  private readonly ConcurrentDictionary<string, GraphServiceClient> userClients = new(StringComparer.OrdinalIgnoreCase);
 
-  private string? expectedAuthorizationState;
+  private readonly ConcurrentDictionary<string, PendingAuthorization> pendingAuthorizations = new(StringComparer.Ordinal);
 
-  private string? authorizationCodeVerifier;
-  private readonly Dictionary<string, string> currentEditExcelSessionIds = new();
+  private GraphServiceClient userClient => GetUserClient();
+
+  private readonly ConcurrentDictionary<string, string> currentEditExcelSessionIds = new();
 
   /**
    * シングルトンとして利用するため、外部からのインスタンス生成を禁止する。
@@ -56,13 +62,18 @@ public sealed class GraphHelper
 
     _graphHelper = new GraphHelper();
     _graphHelper.settings = settings;
-    _graphHelper.graphTokenCredential = new OAuthAuthorizationCodeCredential(settings, _graphHelper.GetTokenCachePath());
-    _graphHelper.userClient = new GraphServiceClient(_graphHelper.graphTokenCredential, settings.GraphUserScopes);
 
     return _graphHelper;
   }
 
-  public Uri GetAuthorizationUrl(string redirectUri)
+  public IDisposable UseProfile(string? profile)
+  {
+    var previousProfile = CurrentProfile.Value;
+    CurrentProfile.Value = NormalizeProfile(profile);
+    return new ProfileScope(previousProfile);
+  }
+
+  public Uri GetAuthorizationUrl(string redirectUri, string? profile = null)
   {
     _ = settings?.ClientId ??
       throw new NullReferenceException("Settings.ClientId cannot be null");
@@ -71,9 +82,12 @@ public sealed class GraphHelper
     _ = settings.GraphUserScopes ??
       throw new NullReferenceException("Settings.GraphUserScopes cannot be null");
 
-    expectedAuthorizationState = Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
-    authorizationCodeVerifier = Base64UrlEncode(RandomNumberGenerator.GetBytes(64));
-    var codeChallenge = Base64UrlEncode(SHA256.HashData(Encoding.ASCII.GetBytes(authorizationCodeVerifier)));
+    var normalizedProfile = NormalizeProfile(profile);
+    var state = Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
+    var codeVerifier = Base64UrlEncode(RandomNumberGenerator.GetBytes(64));
+    var codeChallenge = Base64UrlEncode(SHA256.HashData(Encoding.ASCII.GetBytes(codeVerifier)));
+    pendingAuthorizations[state] = new PendingAuthorization(normalizedProfile, codeVerifier, DateTimeOffset.UtcNow.AddMinutes(10));
+
     var authorizationScopes = WithOfflineAccess(settings.GraphUserScopes);
     var query = ToQueryString(new Dictionary<string, string>
     {
@@ -82,7 +96,7 @@ public sealed class GraphHelper
       ["redirect_uri"] = redirectUri,
       ["response_mode"] = "query",
       ["scope"] = string.Join(" ", authorizationScopes),
-      ["state"] = expectedAuthorizationState,
+      ["state"] = state,
       ["code_challenge"] = codeChallenge,
       ["code_challenge_method"] = "S256",
       ["prompt"] = "select_account",
@@ -91,39 +105,57 @@ public sealed class GraphHelper
     return new Uri($"https://login.microsoftonline.com/{Uri.EscapeDataString(settings.TenantId)}/oauth2/v2.0/authorize?{query}");
   }
 
-  public async Task CompleteAuthorizationCodeFlowAsync(string code, string state, string redirectUri)
+  public async Task<string> CompleteAuthorizationCodeFlowAsync(string code, string state, string redirectUri)
   {
-    _ = graphTokenCredential ??
-      throw new NullReferenceException("Graph has not been initialized for user auth");
-
-    if (string.IsNullOrWhiteSpace(expectedAuthorizationState) || !string.Equals(expectedAuthorizationState, state, StringComparison.Ordinal))
+    if (!pendingAuthorizations.TryRemove(state, out var authorization))
     {
       throw new InvalidOperationException("The authorization state is invalid or expired. Start authentication again from /auth/login.");
     }
 
-    if (string.IsNullOrWhiteSpace(authorizationCodeVerifier))
+    if (authorization.ExpiresOn <= DateTimeOffset.UtcNow)
     {
-      throw new InvalidOperationException("The authorization code verifier is missing. Start authentication again from /auth/login.");
+      throw new InvalidOperationException("The authorization state has expired. Start authentication again from /auth/login.");
     }
 
-    await graphTokenCredential.ExchangeAuthorizationCodeAsync(code, redirectUri, authorizationCodeVerifier);
-    expectedAuthorizationState = null;
-    authorizationCodeVerifier = null;
+    await GetCredential(authorization.Profile).ExchangeAuthorizationCodeAsync(code, redirectUri, authorization.CodeVerifier);
+    return authorization.Profile;
   }
 
-  public async Task<bool> IsAuthenticatedAsync()
+  public async Task<bool> IsAuthenticatedAsync(string? profile = null)
   {
-    _ = graphTokenCredential ??
-      throw new NullReferenceException("Graph has not been initialized for user auth");
-
-    return await graphTokenCredential.HasCachedRefreshTokenAsync();
+    return await GetCredential(profile).HasCachedRefreshTokenAsync();
   }
 
-  private string GetTokenCachePath()
+  private OAuthAuthorizationCodeCredential GetCredential(string? profile = null)
   {
+    _ = settings ??
+      throw new NullReferenceException("Settings cannot be null");
+
+    var normalizedProfile = NormalizeProfile(profile);
+    return graphTokenCredentials.GetOrAdd(normalizedProfile, key => new OAuthAuthorizationCodeCredential(settings, GetTokenCachePath(key), key));
+  }
+
+  private GraphServiceClient GetUserClient()
+  {
+    _ = settings?.GraphUserScopes ??
+      throw new NullReferenceException("Settings.GraphUserScopes cannot be null");
+
+    var profile = GetCurrentProfile();
+    return userClients.GetOrAdd(profile, key => new GraphServiceClient(GetCredential(key), settings.GraphUserScopes));
+  }
+
+  private string GetCurrentProfile() => NormalizeProfile(CurrentProfile.Value);
+
+  private string GetWorkbookSessionKey(string? driveItemId) => $"{GetCurrentProfile()}:{driveItemId}";
+
+  private string GetTokenCachePath(string profile)
+  {
+    var normalizedProfile = NormalizeProfile(profile);
     if (!string.IsNullOrWhiteSpace(settings?.TokenCachePath))
     {
-      return settings.TokenCachePath;
+      return normalizedProfile == DefaultProfile
+        ? settings.TokenCachePath
+        : ToProfileTokenCachePath(settings.TokenCachePath, normalizedProfile);
     }
 
     var basePath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -132,7 +164,34 @@ public sealed class GraphHelper
       basePath = AppContext.BaseDirectory;
     }
 
-    return Path.Combine(basePath, "edit-excel-mcp", "oauth-token-cache.json");
+    return Path.Combine(basePath, "edit-excel-mcp", $"{normalizedProfile}.oauth-token-cache.json");
+  }
+
+  private static string ToProfileTokenCachePath(string tokenCachePath, string profile)
+  {
+    var directory = Path.GetDirectoryName(tokenCachePath);
+    var fileName = Path.GetFileNameWithoutExtension(tokenCachePath);
+    var extension = Path.GetExtension(tokenCachePath);
+    return Path.Combine(string.IsNullOrEmpty(directory) ? "." : directory, $"{fileName}.{profile}{extension}");
+  }
+
+  public static string NormalizeProfile(string? profile)
+  {
+    var normalizedProfile = string.IsNullOrWhiteSpace(profile) ? DefaultProfile : profile.Trim();
+    if (normalizedProfile.Any(c => !(char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.')))
+    {
+      throw new ArgumentException("Profile can contain only letters, digits, hyphen, underscore, and dot.", nameof(profile));
+    }
+
+    return normalizedProfile;
+  }
+
+  private sealed class ProfileScope(string? previousProfile) : IDisposable
+  {
+    public void Dispose()
+    {
+      CurrentProfile.Value = previousProfile;
+    }
   }
 
   private static string Base64UrlEncode(byte[] bytes)
@@ -300,7 +359,7 @@ public sealed class GraphHelper
       throw new Exception($"Failed to create excel session {drive.Name}/{driveItem.Name}");
     }
 
-    currentEditExcelSessionIds[driveItem.Id] = result.Id!;
+    currentEditExcelSessionIds[GetWorkbookSessionKey(driveItem.Id)] = result.Id!;
   }
 
   /**
@@ -317,9 +376,10 @@ public sealed class GraphHelper
     _ = driveItem.Id ??
       throw new NullReferenceException("Drive item id cannot be null");
 
-    if (currentEditExcelSessionIds.TryGetValue(driveItem.Id, out var sessionId)) {
+    var sessionKey = GetWorkbookSessionKey(driveItem.Id);
+    if (currentEditExcelSessionIds.TryGetValue(sessionKey, out var sessionId)) {
       await userClient.Drives[drive.Id].Items[driveItem.Id].Workbook.CloseSession.PostAsync(requestConfiguration => requestConfiguration.Headers.Add("Workbook-Session-Id", sessionId));
-      currentEditExcelSessionIds.Remove(driveItem.Id);
+      currentEditExcelSessionIds.TryRemove(sessionKey, out _);
     }
   }
 
@@ -1084,7 +1144,7 @@ public sealed class GraphHelper
    * Excel workbook session 用のヘッダーを追加する。
    */
   private void AddWorkbookSessionHeader(Microsoft.Kiota.Abstractions.RequestHeaders headers, string? driveItemId) {
-    if (driveItemId != null && currentEditExcelSessionIds.TryGetValue(driveItemId, out var sessionId))
+    if (driveItemId != null && currentEditExcelSessionIds.TryGetValue(GetWorkbookSessionKey(driveItemId), out var sessionId))
     {
       headers.Add("Workbook-Session-Id", sessionId);
     }
@@ -1132,7 +1192,7 @@ public sealed class GraphHelper
 }
 
 
-public sealed class OAuthAuthorizationCodeCredential(Settings settings, string tokenCachePath) : TokenCredential
+public sealed class OAuthAuthorizationCodeCredential(Settings settings, string tokenCachePath, string profile) : TokenCredential
 {
   private static readonly HttpClient HttpClient = new();
 
@@ -1146,7 +1206,7 @@ public sealed class OAuthAuthorizationCodeCredential(Settings settings, string t
     var cache = await ReadTokenCacheAsync(cancellationToken);
     if (cache?.RefreshToken == null)
     {
-      throw new InvalidOperationException("Microsoft Graph is not authenticated. Open /auth/login in this MCP server, sign in, then retry the tool call.");
+      throw new InvalidOperationException($"Microsoft Graph is not authenticated. Open /auth/login?profile={Uri.EscapeDataString(profile)} in this MCP server, sign in, then retry the tool call.");
     }
 
     if (cache.AccessToken != null && cache.ExpiresOn > DateTimeOffset.UtcNow.AddMinutes(5))
@@ -1243,3 +1303,5 @@ public sealed record OAuthTokenResponse(
   [property: JsonPropertyName("access_token")] string? AccessToken,
   [property: JsonPropertyName("refresh_token")] string? RefreshToken,
   [property: JsonPropertyName("expires_in")] int ExpiresIn);
+
+public sealed record PendingAuthorization(string Profile, string CodeVerifier, DateTimeOffset ExpiresOn);

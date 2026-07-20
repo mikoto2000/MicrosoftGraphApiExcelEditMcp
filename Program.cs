@@ -31,23 +31,35 @@ app.MapGet("/", () => Results.Ok(new
 {
   name = "Microsoft Graph Excel MCP Server",
   endpoint = "/mcp",
+  profile = new
+  {
+    header = "X-Excel-Mcp-Profile",
+    query = "profile",
+    defaultValue = GraphHelper.DefaultProfile,
+  },
   authentication = new
   {
-    login = "/auth/login",
+    login = "/auth/login?profile=default",
     callback = "/auth/callback",
-    status = "/auth/status",
+    status = "/auth/status?profile=default",
   },
 }));
 
-app.MapGet("/auth/status", async (GraphHelper graph) => Results.Ok(new
+app.MapGet("/auth/status", async (HttpContext context, GraphHelper graph) =>
 {
-  authenticated = await graph.IsAuthenticatedAsync(),
-}));
+  var profile = GetProfile(context);
+  return Results.Ok(new
+  {
+    profile,
+    authenticated = await graph.IsAuthenticatedAsync(profile),
+  });
+});
 
 app.MapGet("/auth/login", async (HttpContext context, GraphHelper graph) =>
 {
+  var profile = GetProfile(context);
   var redirectUri = BuildAuthCallbackUri(context);
-  var authorizationUrl = graph.GetAuthorizationUrl(redirectUri);
+  var authorizationUrl = graph.GetAuthorizationUrl(redirectUri, profile);
   return Results.Redirect(authorizationUrl.ToString());
 });
 
@@ -70,12 +82,20 @@ app.MapGet("/auth/callback", async (HttpContext context, GraphHelper graph) =>
 
   try
   {
-    await graph.CompleteAuthorizationCodeFlowAsync(code, state, BuildAuthCallbackUri(context));
-    return Results.Content("Microsoft Graph authentication completed. You can close this page and retry the MCP tool call.", "text/plain");
+    var profile = await graph.CompleteAuthorizationCodeFlowAsync(code, state, BuildAuthCallbackUri(context));
+    return Results.Content($"Microsoft Graph authentication completed for profile '{profile}'. You can close this page and retry the MCP tool call.", "text/plain");
   }
   catch (Exception ex)
   {
     return Results.Problem(ex.Message, statusCode: StatusCodes.Status400BadRequest);
+  }
+});
+
+app.Use(async (context, next) =>
+{
+  using (app.Services.GetRequiredService<GraphHelper>().UseProfile(GetProfile(context)))
+  {
+    await next(context);
   }
 });
 
@@ -91,4 +111,16 @@ static string BuildAuthCallbackUri(HttpContext context)
     context.Request.Host,
     context.Request.PathBase,
     "/auth/callback");
+}
+
+
+static string GetProfile(HttpContext context)
+{
+  var profile = context.Request.Query["profile"].ToString();
+  if (string.IsNullOrWhiteSpace(profile) && context.Request.Headers.TryGetValue("X-Excel-Mcp-Profile", out var headerValues))
+  {
+    profile = headerValues.ToString();
+  }
+
+  return GraphHelper.NormalizeProfile(profile);
 }
