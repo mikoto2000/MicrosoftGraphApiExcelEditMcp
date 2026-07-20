@@ -10,6 +10,8 @@ public record class Settings
 
   public string? TenantId { get; set; }
 
+  public string? ApiAudience { get; set; }
+
   public string[]? GraphUserScopes { get; set; }
 
   public string? TokenCachePath { get; set; }

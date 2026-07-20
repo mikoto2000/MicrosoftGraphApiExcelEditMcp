@@ -54,6 +54,7 @@ Azure アプリ登録の種類により、設定方法が変わります。
     "ClientId": "Azure アプリ登録のアプリケーション クライアント ID",
     "ClientSecret": "Web プラットフォームを使う場合の client secret。不要な場合は空文字",
     "TenantId": "Microsoft Entra ID のテナント ID",
+    "ApiAudience": "Excel MCP API の audience。例: api://<ClientId>",
     "GraphUserScopes": [
       "Sites.ReadWrite.All",
       "Files.ReadWrite.All"
@@ -64,6 +65,8 @@ Azure アプリ登録の種類により、設定方法が変わります。
 ```
 
 `ClientSecret` には、Azure portal で作成したシークレットの **Value** を指定します。Secret ID ではありません。
+
+`ApiAudience` は OBO Flow で MCP サーバーが受け取る access token の audience です。Azure アプリ登録で Expose an API を有効化し、Application ID URI を `api://<ClientId>` にした場合は、その値を指定します。
 
 `TokenCachePath` を空にした場合、トークンキャッシュは OS のローカルアプリケーションデータ配下に profile ごとに保存されます。明示した場合も、`default` 以外の profile はファイル名に profile 名を付けて分離されます。
 
@@ -87,6 +90,13 @@ http://localhost:3001/
 
 ## 認証
 
+このサーバーは 2 種類の認証方式に対応しています。
+
+- Authorization Code Flow: ブラウザーで Microsoft にサインインし、profile ごとのトークンキャッシュを使います
+- On-Behalf-Of Flow: MCP クライアントが送った Excel MCP API 宛て Bearer token を、Microsoft Graph 用 token に交換します
+
+### Authorization Code Flow
+
 初回利用時、ブラウザーで認証 URL を開いて Microsoft にサインインします。
 
 ```text
@@ -108,9 +118,31 @@ http://localhost:3001/auth/status
 }
 ```
 
+### On-Behalf-Of Flow
+
+Dify、Web アプリ、proxy などの前段クライアントが Microsoft Entra ID から **この Excel MCP API 宛て** の access token を取得できる場合、MCP リクエストに次のヘッダーを付けます。
+
+```text
+Authorization: Bearer <access token for Excel MCP API>
+```
+
+このサーバーは incoming token を検証し、OBO Flow で Microsoft Graph 用 access token に交換して Excel API を呼び出します。この場合、`/auth/login` による profile 認証は不要です。
+
+OBO 用の incoming token は、Microsoft Graph 宛て token ではなく Excel MCP API 宛て token である必要があります。token の `aud` が `ApiAudience`、`api://<ClientId>`、または `<ClientId>` のいずれかと一致しない場合は拒否されます。
+
+OBO で使う Azure アプリ登録では、Expose an API で scope を作成します。例:
+
+```text
+api://<ClientId>/access_as_user
+```
+
+前段クライアントはこの scope を要求して access token を取得します。MCP サーバー側は、その token を OBO の `assertion` として使い、`GraphUserScopes` に設定した Microsoft Graph delegated scope の token を取得します。
+
 ## 複数ユーザーで使う場合
 
-このサーバーは `profile` ごとに Microsoft Graph の認証情報、トークンキャッシュ、Excel workbook session を分離します。
+Authorization Code Flow では、`profile` ごとに Microsoft Graph の認証情報、トークンキャッシュ、Excel workbook session を分離します。
+
+OBO Flow では、検証済み Bearer token の `tid` と `oid` から profile を自動生成します。`X-Excel-Mcp-Profile` または `profile` query を明示した場合は、その値を session 分離キーとして使います。
 
 ユーザーごとに別の profile 名で認証してください。
 
@@ -129,13 +161,13 @@ X-Excel-Mcp-Profile: alice
 
 profile 名に使える文字は、英数字、ハイフン、アンダースコア、ドットです。
 
-Dify などでエンドユーザーごとに profile を変えたい場合は、Dify 側のユーザー ID を `X-Excel-Mcp-Profile` ヘッダーに設定してください。例:
+Dify などで Authorization Code Flow を使い、エンドユーザーごとに profile を変えたい場合は、Dify 側のユーザー ID を `X-Excel-Mcp-Profile` ヘッダーに設定してください。例:
 
 ```text
 X-Excel-Mcp-Profile: {{#sys.user_id#}}
 ```
 
-Dify の MCP 設定で動的ヘッダーを設定できない場合は、Dify とこの MCP サーバーの間に proxy を置き、proxy 側でユーザー ID から `X-Excel-Mcp-Profile` を付与してください。
+Dify から Entra access token を渡せる場合は、`X-Excel-Mcp-Profile` ではなく OBO Flow を使う構成がより自然です。Dify の MCP 設定だけで token や動的ヘッダーを扱えない場合は、Dify とこの MCP サーバーの間に proxy を置き、proxy 側で `Authorization: Bearer ...` または `X-Excel-Mcp-Profile` を付与してください。
 
 ## SharePoint siteId
 
@@ -198,6 +230,12 @@ http://localhost:3001/auth/callback
 Azure アプリ登録で Web プラットフォームの redirect URI を使っている場合、token 交換には client secret が必要です。
 
 `appsettings.json` の `ClientSecret` に、Azure portal で作成した client secret の Value を設定してください。
+
+### Invalid bearer token for this MCP server
+
+OBO Flow の Bearer token が無効、期限切れ、または Excel MCP API 宛てではありません。前段クライアントが `api://<ClientId>/access_as_user` など、この MCP API の scope を要求して token を取得しているか確認してください。
+
+`IDX10205: Issuer validation failed` で issuer が `https://sts.windows.net/<TenantId>/` の場合、Entra ID が v1 access token を発行しています。このサーバーは v1 issuer と v2 issuer の両方を許可しますが、Azure 側で v2 token に揃える場合は Excel MCP API App Registration の manifest で `accessTokenAcceptedVersion` を `2` に設定してください。
 
 ### Microsoft Graph is not authenticated
 

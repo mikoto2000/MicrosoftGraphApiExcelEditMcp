@@ -24,6 +24,8 @@ public sealed class GraphHelper
 
   private static readonly AsyncLocal<string?> CurrentProfile = new();
 
+  private static readonly AsyncLocal<string?> CurrentUserAssertion = new();
+
   private Settings? settings;
 
   private readonly ConcurrentDictionary<string, OAuthAuthorizationCodeCredential> graphTokenCredentials = new(StringComparer.OrdinalIgnoreCase);
@@ -68,10 +70,19 @@ public sealed class GraphHelper
 
   public IDisposable UseProfile(string? profile)
   {
-    var previousProfile = CurrentProfile.Value;
-    CurrentProfile.Value = NormalizeProfile(profile);
-    return new ProfileScope(previousProfile);
+    return UseRequestContext(profile, null);
   }
+
+  public IDisposable UseRequestContext(string? profile, string? userAssertion)
+  {
+    var previousProfile = CurrentProfile.Value;
+    var previousUserAssertion = CurrentUserAssertion.Value;
+    CurrentProfile.Value = NormalizeProfile(profile);
+    CurrentUserAssertion.Value = string.IsNullOrWhiteSpace(userAssertion) ? null : userAssertion;
+    return new RequestContextScope(previousProfile, previousUserAssertion);
+  }
+
+  public static string? GetCurrentUserAssertion() => CurrentUserAssertion.Value;
 
   public Uri GetAuthorizationUrl(string redirectUri, string? profile = null)
   {
@@ -186,11 +197,12 @@ public sealed class GraphHelper
     return normalizedProfile;
   }
 
-  private sealed class ProfileScope(string? previousProfile) : IDisposable
+  private sealed class RequestContextScope(string? previousProfile, string? previousUserAssertion) : IDisposable
   {
     public void Dispose()
     {
       CurrentProfile.Value = previousProfile;
+      CurrentUserAssertion.Value = previousUserAssertion;
     }
   }
 
@@ -1196,6 +1208,8 @@ public sealed class OAuthAuthorizationCodeCredential(Settings settings, string t
 {
   private static readonly HttpClient HttpClient = new();
 
+  private readonly ConcurrentDictionary<string, CachedOAuthToken> onBehalfOfTokenCache = new();
+
   public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
   {
     return GetTokenAsync(requestContext, cancellationToken).AsTask().GetAwaiter().GetResult();
@@ -1203,6 +1217,12 @@ public sealed class OAuthAuthorizationCodeCredential(Settings settings, string t
 
   public override async ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken)
   {
+    var userAssertion = GraphHelper.GetCurrentUserAssertion();
+    if (!string.IsNullOrWhiteSpace(userAssertion))
+    {
+      return await GetOnBehalfOfTokenAsync(requestContext, userAssertion, cancellationToken);
+    }
+
     var cache = await ReadTokenCacheAsync(cancellationToken);
     if (cache?.RefreshToken == null)
     {
@@ -1229,6 +1249,33 @@ public sealed class OAuthAuthorizationCodeCredential(Settings settings, string t
 
     await WriteTokenCacheAsync(refreshed, cancellationToken);
     return new AccessToken(refreshed.AccessToken!, refreshed.ExpiresOn);
+  }
+
+  private async Task<AccessToken> GetOnBehalfOfTokenAsync(TokenRequestContext requestContext, string userAssertion, CancellationToken cancellationToken)
+  {
+    var scopes = requestContext.Scopes.Length > 0 ? requestContext.Scopes : settings.GraphUserScopes!;
+    var cacheKey = ToCacheKey(userAssertion, scopes);
+    if (onBehalfOfTokenCache.TryGetValue(cacheKey, out var cachedToken) && cachedToken.AccessToken != null && cachedToken.ExpiresOn > DateTimeOffset.UtcNow.AddMinutes(5))
+    {
+      return new AccessToken(cachedToken.AccessToken, cachedToken.ExpiresOn);
+    }
+
+    var token = await RequestTokenAsync(new Dictionary<string, string>
+    {
+      ["client_id"] = settings.ClientId!,
+      ["grant_type"] = "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      ["assertion"] = userAssertion,
+      ["requested_token_use"] = "on_behalf_of",
+      ["scope"] = string.Join(" ", scopes),
+    }, cancellationToken);
+    onBehalfOfTokenCache[cacheKey] = token;
+    return new AccessToken(token.AccessToken!, token.ExpiresOn);
+  }
+
+  private static string ToCacheKey(string userAssertion, IReadOnlyList<string> scopes)
+  {
+    var cacheMaterial = userAssertion + "\n" + string.Join(" ", scopes.OrderBy(scope => scope, StringComparer.Ordinal));
+    return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(cacheMaterial)));
   }
 
   public async Task ExchangeAuthorizationCodeAsync(string code, string redirectUri, string codeVerifier)

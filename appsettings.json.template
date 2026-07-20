@@ -3,10 +3,12 @@
     "clientId": "",
     "clientSecret": "",
     "tenantId": "",
+    "apiAudience": "api://<client-id>",
     "graphUserScopes": [
       "Files.ReadWrite"
     ],
-    "tokenCachePath": ""
+    "tokenCachePath": "",
+    "ApiAudience": ""
   }
 }
 
